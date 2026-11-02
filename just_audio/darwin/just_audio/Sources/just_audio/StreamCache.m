@@ -15,6 +15,7 @@ static const int64_t kDeliveryIntervalNs = 10 * NSEC_PER_MSEC;
 // would only delay playback that is possible right now.
 static const NSTimeInterval kStoredProbeTimeout = 3;
 static const NSInteger kMaxRetries = 4;
+static const NSTimeInterval kResponseTimeTolerance = 5;
 static char kLoaderKey;
 
 #pragma mark - Entry
@@ -555,11 +556,27 @@ static long long TotalLength(NSHTTPURLResponse *response) {
     return response.expectedContentLength;
 }
 
+/// Some ad-serving CDNs (Triton) send the time of the response as Last-Modified,
+/// so it differs on every request for the very same bytes.
+static NSString *StableLastModified(NSHTTPURLResponse *response) {
+    NSString *modified = HeaderValue(response, @"Last-Modified");
+    NSString *date = HeaderValue(response, @"Date");
+    if (!modified || !date) return modified;
+    NSDateFormatter *format = [[NSDateFormatter alloc] init];
+    format.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    format.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:0];
+    format.dateFormat = @"EEE, dd MMM yyyy HH:mm:ss zzz";
+    NSDate *modifiedAt = [format dateFromString:modified];
+    NSDate *respondedAt = [format dateFromString:date];
+    if (!modifiedAt || !respondedAt) return modified;
+    return [respondedAt timeIntervalSinceDate:modifiedAt] < kResponseTimeTolerance ? nil : modified;
+}
+
 /// The strongest identity offered. A weak ETag promises equivalence, not equal bytes.
 static NSString *ValidatorOf(NSHTTPURLResponse *response, long long total) {
     NSString *etag = HeaderValue(response, @"ETag");
     if (etag && ![etag hasPrefix:@"W/"]) return [@"etag:" stringByAppendingString:etag];
-    NSString *modified = HeaderValue(response, @"Last-Modified");
+    NSString *modified = StableLastModified(response);
     if (modified) return [@"modified:" stringByAppendingString:modified];
     return 0 < total ? [NSString stringWithFormat:@"length:%lld", total] : nil;
 }
@@ -589,7 +606,8 @@ static long long BodyStart(NSHTTPURLResponse *response) {
 static NSString *IfRangeOf(NSHTTPURLResponse *response) {
     NSString *etag = HeaderValue(response, @"ETag");
     if (etag && ![etag hasPrefix:@"W/"]) return etag;
-    return HeaderValue(response, @"Last-Modified");
+    // If-Range with a response time would make the server answer 200 every time.
+    return StableLastModified(response);
 }
 
 /// AVPlayer needs a UTI. Podcast CDNs often answer octet-stream, so fall back

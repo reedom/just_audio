@@ -19,15 +19,19 @@ import androidx.media3.datasource.cache.ContentMetadataMutations;
 import androidx.media3.datasource.cache.SimpleCache;
 import java.io.File;
 import java.io.IOException;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.NavigableSet;
 import java.util.Set;
+import java.util.TimeZone;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -41,6 +45,7 @@ final class StreamCache {
     private static final String DIRECTORY = "stream_audio_cache";
     private static final String VALIDATOR_KEY = "just_audio.validator";
     private static final int PROBE_TIMEOUT_MS = 3000;
+    private static final long RESPONSE_TIME_TOLERANCE_MS = 5000;
 
     /**
      * Streams whose identity changed between requests within one run. Their
@@ -318,9 +323,27 @@ final class StreamCache {
         // A weak ETag only promises equivalent content, not identical bytes.
         if (etag != null && !etag.startsWith("W/")) return "etag:" + etag;
         String modified = header(headers, "last-modified");
-        if (modified != null) return "modified:" + modified;
+        if (modified != null && !isResponseTime(modified, header(headers, "date"))) return "modified:" + modified;
         long total = totalOf(headers, C.LENGTH_UNSET);
         return total == C.LENGTH_UNSET ? null : "length:" + total;
+    }
+
+    /**
+     * Some ad-serving CDNs (Triton) send the time of the response as
+     * Last-Modified, so it differs on every request for the very same bytes.
+     */
+    private static boolean isResponseTime(String modified, @Nullable String date) {
+        if (date == null) return false;
+        SimpleDateFormat format = new SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US);
+        format.setTimeZone(TimeZone.getTimeZone("GMT"));
+        try {
+            Date modifiedAt = format.parse(modified);
+            Date respondedAt = format.parse(date);
+            return modifiedAt != null && respondedAt != null
+                    && respondedAt.getTime() - modifiedAt.getTime() < RESPONSE_TIME_TOLERANCE_MS;
+        } catch (ParseException e) {
+            return false;
+        }
     }
 
     private static long totalOf(Map<String, List<String>> headers, long fallback) {
