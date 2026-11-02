@@ -635,7 +635,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         String id = (String)map.get("id");
         switch ((String)map.get("type")) {
         case "progressive":
-            return new ProgressiveMediaSource.Factory(buildDataSourceFactory(mapGet(map, "headers")), buildExtractorsFactory(mapGet(map, "options")))
+            return new ProgressiveMediaSource.Factory(buildDataSourceFactory(mapGet(map, "headers"), true), buildExtractorsFactory(mapGet(map, "options")))
                     .createMediaSource(new MediaItem.Builder()
                             .setUri(Uri.parse((String)map.get("uri")))
                             .setTag(id)
@@ -729,6 +729,10 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     }
 
     private DataSource.Factory buildDataSourceFactory(Map<?, ?> headers) {
+        return buildDataSourceFactory(headers, false);
+    }
+
+    private DataSource.Factory buildDataSourceFactory(Map<?, ?> headers, boolean cacheable) {
         final Map<String, String> stringHeaders = castToStringMap(headers);
         String userAgent = null;
         if (stringHeaders != null) {
@@ -746,7 +750,8 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         if (stringHeaders != null && stringHeaders.size() > 0) {
             httpDataSourceFactory.setDefaultRequestProperties(stringHeaders);
         }
-        return new DefaultDataSource.Factory(context, httpDataSourceFactory);
+        // DefaultDataSource still routes file: URIs around the cache.
+        return new DefaultDataSource.Factory(context, cacheable ? StreamCache.wrap(httpDataSourceFactory) : httpDataSourceFactory);
     }
 
     private void load(final List<MediaSource> mediaSources, ShuffleOrder shuffleOrder, final long initialPosition, final Integer initialIndex, final Result result) {

@@ -1,5 +1,6 @@
 #import "./include/just_audio/JustAudioPlugin.h"
 #import "./include/just_audio/AudioPlayer.h"
+#import "./include/just_audio/StreamCache.h"
 #import <AVFoundation/AVFoundation.h>
 #include <TargetConditionals.h>
 
@@ -51,6 +52,28 @@
         }
         [_players removeAllObjects];
         result(@{});
+    } else if ([@"streamCacheConfigure" isEqualToString:call.method]) {
+        NSDictionary *request = (NSDictionary *)call.arguments;
+        [[StreamCache shared] configureWithMaxBytes:[request[@"maxBytes"] longLongValue]];
+        result(nil);
+    } else if ([@"streamCacheSize" isEqualToString:call.method]) {
+        [[StreamCache shared] sizeWithCompletion:^(long long size) {
+            dispatch_async(dispatch_get_main_queue(), ^{ result(@(size)); });
+        }];
+    } else if ([@"streamCacheUrls" isEqualToString:call.method]) {
+        [[StreamCache shared] urlsWithCompletion:^(NSArray<NSString *> *urls) {
+            dispatch_async(dispatch_get_main_queue(), ^{ result(urls); });
+        }];
+    } else if ([@"streamCacheClear" isEqualToString:call.method]) {
+        NSDictionary *request = (NSDictionary *)call.arguments;
+        [[StreamCache shared] clearKeeping:request[@"keep"] includeInUse:[request[@"includeInUse"] boolValue] completion:^{
+            dispatch_async(dispatch_get_main_queue(), ^{ result(nil); });
+        }];
+    } else if ([@"streamCacheRemove" isEqualToString:call.method]) {
+        NSDictionary *request = (NSDictionary *)call.arguments;
+        [[StreamCache shared] removeURL:request[@"url"] completion:^{
+            dispatch_async(dispatch_get_main_queue(), ^{ result(nil); });
+        }];
     } else {
         result(FlutterMethodNotImplemented);
     }

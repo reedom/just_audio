@@ -2,6 +2,7 @@
 #import "./include/just_audio/IndexedAudioSource.h"
 #import "./include/just_audio/IndexedPlayerItem.h"
 #import "./include/just_audio/LoadControl.h"
+#import "./include/just_audio/StreamCache.h"
 #import <AVFoundation/AVFoundation.h>
 
 @implementation UriAudioSource {
@@ -69,7 +70,11 @@
             }
         }
         
-        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL URLWithString:uri] options:assetOptions];
+        // The cache makes its own requests and does not forward custom headers.
+        AVURLAsset *asset = _headers.count == 0 ? [[StreamCache shared] assetForURI:uri options:assetOptions] : nil;
+        if (!asset) {
+            asset = [AVURLAsset URLAssetWithURL:[NSURL URLWithString:uri] options:assetOptions];
+        }
         item = [[IndexedPlayerItem alloc] initWithAsset:asset];
     }
     if (@available(macOS 10.13, iOS 11.0, *)) {

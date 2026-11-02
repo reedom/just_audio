@@ -4614,3 +4614,56 @@ HttpClient _createHttpClient({String? userAgent}) {
   }
   return client;
 }
+
+/// Disk cache for streamed progressive audio, on Android and iOS.
+///
+/// Unlike [LockCachingAudioSource] this stores only what the player reads, so
+/// it adds no network use. Once [configure] has been called, every progressive
+/// HTTP source loaded afterwards goes through it.
+class StreamAudioCache {
+  static const _channel = MethodChannel('com.ryanheise.just_audio.methods');
+
+  StreamAudioCache._();
+
+  static bool get _isSupported => !kIsWeb && (Platform.isAndroid || Platform.isIOS);
+
+  /// Turns the cache on and limits it to [maxBytes].
+  static Future<void> configure({required int maxBytes}) async {
+    if (!_isSupported) return;
+    await _channel.invokeMethod<void>(
+        'streamCacheConfigure', {'maxBytes': maxBytes});
+  }
+
+  /// The bytes currently stored.
+  static Future<int> size() async {
+    if (!_isSupported) return 0;
+    return await _channel.invokeMethod<int>('streamCacheSize') ?? 0;
+  }
+
+  /// The URLs that have bytes stored.
+  static Future<List<String>> urls() async {
+    if (!_isSupported) return const [];
+    return await _channel.invokeListMethod<String>('streamCacheUrls') ??
+        const [];
+  }
+
+  /// Removes everything except the URLs in [keep]. The stream in use also
+  /// stays unless [includeInUse] is true, which is only safe once the player
+  /// has stopped.
+  static Future<void> clear({
+    Set<String> keep = const {},
+    bool includeInUse = false,
+  }) async {
+    if (!_isSupported) return;
+    await _channel.invokeMethod<void>('streamCacheClear', {
+      'keep': keep.toList(),
+      'includeInUse': includeInUse,
+    });
+  }
+
+  /// Removes the bytes of [url] unless it is the stream in use.
+  static Future<void> remove(String url) async {
+    if (!_isSupported) return;
+    await _channel.invokeMethod<void>('streamCacheRemove', {'url': url});
+  }
+}
