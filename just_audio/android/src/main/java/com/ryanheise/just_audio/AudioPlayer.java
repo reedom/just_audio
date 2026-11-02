@@ -751,7 +751,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             httpDataSourceFactory.setDefaultRequestProperties(stringHeaders);
         }
         // DefaultDataSource still routes file: URIs around the cache.
-        return new DefaultDataSource.Factory(context, cacheable ? StreamCache.wrap(httpDataSourceFactory) : httpDataSourceFactory);
+        return new DefaultDataSource.Factory(context, cacheable ? StreamCache.wrap(httpDataSourceFactory, userAgent, stringHeaders) : httpDataSourceFactory);
     }
 
     private void load(final List<MediaSource> mediaSources, ShuffleOrder shuffleOrder, final long initialPosition, final Integer initialIndex, final Result result) {

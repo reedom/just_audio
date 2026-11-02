@@ -8,6 +8,7 @@ import androidx.media3.common.C;
 import androidx.media3.database.StandaloneDatabaseProvider;
 import androidx.media3.datasource.DataSource;
 import androidx.media3.datasource.DataSpec;
+import androidx.media3.datasource.DefaultHttpDataSource;
 import androidx.media3.datasource.HttpDataSource;
 import androidx.media3.datasource.TransferListener;
 import androidx.media3.datasource.cache.Cache;
@@ -20,10 +21,15 @@ import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.NavigableSet;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Disk cache for progressive streams.
@@ -34,6 +40,14 @@ import java.util.NavigableSet;
 final class StreamCache {
     private static final String DIRECTORY = "stream_audio_cache";
     private static final String VALIDATOR_KEY = "just_audio.validator";
+    private static final int PROBE_TIMEOUT_MS = 3000;
+
+    /**
+     * Streams whose identity changed between requests within one run. Their
+     * server gives no stable file to cache, so they stream directly, which is
+     * what they did before this cache existed.
+     */
+    private static final Set<String> uncacheable = ConcurrentHashMap.newKeySet();
 
     @Nullable private static SimpleCache cache;
     @Nullable private static EpisodeLruEvictor evictor;
@@ -55,20 +69,26 @@ final class StreamCache {
     }
 
     /** Returns [upstream] unchanged until [configure] has been called. */
-    static synchronized DataSource.Factory wrap(HttpDataSource.Factory upstream) {
+    static synchronized DataSource.Factory wrap(HttpDataSource.Factory upstream, String userAgent, @Nullable Map<String, String> headers) {
         final SimpleCache c = cache;
         final EpisodeLruEvictor e = evictor;
         if (c == null || e == null) return upstream;
-        return new CacheDataSource.Factory()
+        final CacheDataSource.Factory cached = new CacheDataSource.Factory()
                 .setCache(c)
-                .setCacheKeyFactory(spec -> {
-                    String key = spec.key != null ? spec.key : spec.uri.toString();
-                    e.markInUse(key);
-                    return key;
-                })
                 .setUpstreamDataSourceFactory(() -> new ValidatingDataSource(upstream.createDataSource(), c))
                 // A broken cache must degrade to streaming, not to a playback failure.
                 .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR);
+        // The player already holds what it read: the check must not delay a
+        // fully cached episode for a whole connect timeout on a dead network.
+        final HttpDataSource.Factory probes = new DefaultHttpDataSource.Factory()
+                .setUserAgent(userAgent)
+                .setAllowCrossProtocolRedirects(true)
+                .setConnectTimeoutMs(PROBE_TIMEOUT_MS)
+                .setReadTimeoutMs(PROBE_TIMEOUT_MS);
+        if (headers != null && !headers.isEmpty()) probes.setDefaultRequestProperties(headers);
+        // One factory per load, so the server is asked once per load.
+        final AtomicBoolean probed = new AtomicBoolean(false);
+        return () -> new LoadDataSource(cached.createDataSource(), upstream.createDataSource(), probes, c, e, probed);
     }
 
     static synchronized long size() {
@@ -97,12 +117,114 @@ final class StreamCache {
         cache.removeResource(url);
     }
 
+    private static String keyOf(DataSpec spec) {
+        return spec.key != null ? spec.key : spec.uri.toString();
+    }
+
+    /** What the cache stores must be audio, or it would be replayed forever. */
+    private static boolean isNotAudio(Map<String, List<String>> headers) {
+        String type = header(headers, "content-type");
+        return type != null && type.toLowerCase(Locale.ROOT).startsWith("text/");
+    }
+
     /**
-     * Rejects bytes that do not belong to the file already cached under the URL.
+     * The player's entry point for one load: compares the stored identity with
+     * the server before any stored byte reaches the player, and routes streams
+     * that cannot be cached around the cache.
+     *
+     * The comparison has to come first. ExoPlayer resumes a failed load at the
+     * same byte position with the same seek table, so finding a replaced file
+     * only when playback reaches the first uncached range would splice two
+     * files for the listener even though the store itself stays consistent.
+     */
+    private static final class LoadDataSource implements DataSource {
+        private final DataSource cached;
+        private final HttpDataSource direct;
+        private final HttpDataSource.Factory probes;
+        private final Cache cache;
+        private final EpisodeLruEvictor evictor;
+        private final AtomicBoolean probed;
+        @Nullable private DataSource current;
+        @Nullable private String openKey;
+
+        LoadDataSource(DataSource cached, HttpDataSource direct, HttpDataSource.Factory probes, Cache cache, EpisodeLruEvictor evictor, AtomicBoolean probed) {
+            this.cached = cached;
+            this.direct = direct;
+            this.probes = probes;
+            this.cache = cache;
+            this.evictor = evictor;
+            this.probed = probed;
+        }
+
+        @Override
+        public long open(@NonNull DataSpec spec) throws IOException {
+            String key = keyOf(spec);
+            if (!uncacheable.contains(key) && probed.compareAndSet(false, true)) probe(spec, key);
+            current = uncacheable.contains(key) ? direct : cached;
+            openKey = key;
+            evictor.acquire(key);
+            return current.open(spec);
+        }
+
+        /** Best-effort: offline, a stored entry is still the best available copy. */
+        private void probe(DataSpec spec, String key) {
+            try {
+                if (cache.getCachedSpans(key).isEmpty()) return;
+                String known = cache.getContentMetadata(key).get(VALIDATOR_KEY, (String) null);
+                HttpDataSource probe = probes.createDataSource();
+                try {
+                    probe.open(new DataSpec.Builder().setUri(spec.uri).setPosition(0).setLength(2).build());
+                    Map<String, List<String>> headers = probe.getResponseHeaders();
+                    String validator = validatorOf(headers);
+                    if (isNotAudio(headers)) return;
+                    if (known != null && !known.equals(validator)) cache.removeResource(key);
+                } finally {
+                    probe.close();
+                }
+            } catch (IOException | RuntimeException ignored) {
+                // Includes a cache that failed to initialize; the read path copes.
+            }
+        }
+
+        @Override
+        public int read(@NonNull byte[] buffer, int offset, int length) throws IOException {
+            return current.read(buffer, offset, length);
+        }
+
+        @Override
+        public void addTransferListener(@NonNull TransferListener listener) {
+            cached.addTransferListener(listener);
+            direct.addTransferListener(listener);
+        }
+
+        @Nullable
+        @Override
+        public Uri getUri() {
+            return current == null ? null : current.getUri();
+        }
+
+        @NonNull
+        @Override
+        public Map<String, List<String>> getResponseHeaders() {
+            return current == null ? Collections.emptyMap() : current.getResponseHeaders();
+        }
+
+        @Override
+        public void close() throws IOException {
+            String key = openKey;
+            openKey = null;
+            if (key != null) evictor.release(key);
+            DataSource source = current;
+            current = null;
+            if (source != null) source.close();
+        }
+    }
+
+    /**
+     * Upstream of the cache: keeps bytes of a different file out of an entry.
      *
      * Hosts with dynamic ad insertion can serve a different file per request.
-     * CacheDataSource keys on the URL alone and would splice the two together,
-     * which is audible corruption.
+     * CacheDataSource keys on the URL alone and would store the two as one.
      */
     private static final class ValidatingDataSource implements DataSource {
         private final HttpDataSource upstream;
@@ -116,23 +238,49 @@ final class StreamCache {
         @Override
         public long open(@NonNull DataSpec spec) throws IOException {
             long length = upstream.open(spec);
-            String validator = validatorOf(upstream.getResponseHeaders());
-            if (validator == null) return length;
-            String key = spec.key != null ? spec.key : spec.uri.toString();
-            String known = cache.getContentMetadata(key).get(VALIDATOR_KEY, (String) null);
-            if (known != null && !known.equals(validator)) {
+            Map<String, List<String>> headers = upstream.getResponseHeaders();
+            if (isNotAudio(headers)) {
                 upstream.close();
-                cache.removeResource(key);
-                // ExoPlayer retries the load, which now starts from an empty entry.
-                throw new IOException("Stream changed on the server: " + key);
+                // A captive portal's page: it says nothing about the stored file.
+                throw new IOException("Not audio: " + spec.uri);
             }
-            if (known == null) {
-                ContentMetadataMutations mutations = new ContentMetadataMutations();
-                ContentMetadataMutations.setContentLength(mutations, totalOf(upstream.getResponseHeaders(), length));
-                mutations.set(VALIDATOR_KEY, validator);
-                cache.applyContentMetadataMutations(key, mutations);
+            String validator = validatorOf(headers);
+            String key = keyOf(spec);
+            if (validator == null) {
+                bypass(key);
+                upstream.close();
+                throw new IOException("Stream has no identity: " + key);
+            }
+            try {
+                String known = cache.getContentMetadata(key).get(VALIDATOR_KEY, (String) null);
+                if (known != null && !known.equals(validator)) {
+                    // The load's probe already matched, so this server's identity
+                    // is not stable. ExoPlayer's retry goes around the cache.
+                    bypass(key);
+                    upstream.close();
+                    throw new IOException("Stream identity is not stable: " + key);
+                }
+                if (known == null) {
+                    ContentMetadataMutations mutations = new ContentMetadataMutations();
+                    long total = totalOf(headers, length);
+                    if (total != C.LENGTH_UNSET) ContentMetadataMutations.setContentLength(mutations, total);
+                    mutations.set(VALIDATOR_KEY, validator);
+                    cache.applyContentMetadataMutations(key, mutations);
+                }
+            } catch (Cache.CacheException e) {
+                // Includes failed initialization. The audio itself is fine.
+                bypass(key);
             }
             return length;
+        }
+
+        private void bypass(String key) {
+            uncacheable.add(key);
+            try {
+                cache.removeResource(key);
+            } catch (RuntimeException ignored) {
+                // A cache that failed to initialize holds nothing to remove.
+            }
         }
 
         @Override
@@ -182,8 +330,9 @@ final class StreamCache {
             if (0 <= slash) {
                 try {
                     return Long.parseLong(range.substring(slash + 1).trim());
-                } catch (NumberFormatException ignored) {
-                    // "bytes 0-1/*" has no total; fall through.
+                } catch (NumberFormatException e) {
+                    // "bytes 0-1/*": Content-Length is this part's, not the file's.
+                    return C.LENGTH_UNSET;
                 }
             }
         }
@@ -218,7 +367,8 @@ final class StreamCache {
         private final Map<String, Long> lastUseByKey = new HashMap<>();
         private long maxBytes;
         private long totalBytes;
-        @Nullable private volatile String keyInUse;
+        /** Keys with a source open, counted because a retry can overlap a close. */
+        private final Map<String, Integer> openCounts = new ConcurrentHashMap<>();
 
         EpisodeLruEvictor(long maxBytes) {
             this.maxBytes = maxBytes;
@@ -228,12 +378,16 @@ final class StreamCache {
             this.maxBytes = maxBytes;
         }
 
-        void markInUse(String key) {
-            keyInUse = key;
+        void acquire(String key) {
+            openCounts.merge(key, 1, Integer::sum);
+        }
+
+        void release(String key) {
+            openCounts.computeIfPresent(key, (k, count) -> count <= 1 ? null : count - 1);
         }
 
         boolean isInUse(String key) {
-            return key.equals(keyInUse);
+            return openCounts.containsKey(key);
         }
 
         @Override
@@ -253,7 +407,8 @@ final class StreamCache {
         public void onSpanAdded(@NonNull Cache cache, CacheSpan span) {
             totalBytes += span.length;
             bytesByKey.merge(span.key, span.length, Long::sum);
-            lastUseByKey.put(span.key, span.lastTouchTimestamp);
+            // Spans load in no particular order at startup, so keep the newest.
+            lastUseByKey.merge(span.key, span.lastTouchTimestamp, Math::max);
             evict(cache, span.key, 0);
         }
 
@@ -291,7 +446,7 @@ final class StreamCache {
             long oldest = Long.MAX_VALUE;
             for (Map.Entry<String, Long> entry : lastUseByKey.entrySet()) {
                 String key = entry.getKey();
-                if (key.equals(writingKey) || key.equals(keyInUse)) continue;
+                if (key.equals(writingKey) || isInUse(key)) continue;
                 if (entry.getValue() < oldest) {
                     oldest = entry.getValue();
                     victim = key;

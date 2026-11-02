@@ -8,6 +8,13 @@ static NSString *const kSchemePrefix = @"justaudiocache-";
 static const NSUInteger kDeliveryChunk = 256 * 1024;
 static const long long kEvictInterval = 4 * 1024 * 1024;
 static const long long kMetaSaveInterval = 1024 * 1024;
+// Bounds what is handed to AVFoundation, which has no backpressure of its own,
+// while staying far above any audio bitrate.
+static const int64_t kDeliveryIntervalNs = 10 * NSEC_PER_MSEC;
+// A failed probe of a stored entry falls back to that entry, so waiting long
+// would only delay playback that is possible right now.
+static const NSTimeInterval kStoredProbeTimeout = 3;
+static const NSInteger kMaxRetries = 4;
 static char kLoaderKey;
 
 #pragma mark - Entry
@@ -26,6 +33,11 @@ static char kLoaderKey;
 @property(nonatomic) BOOL hasMetadata;
 @property(nonatomic) BOOL validated;
 @property(nonatomic) BOOL writable;
+/// No longer backed by disk. Whoever still holds it keeps streaming.
+@property(nonatomic) BOOL discarded;
+/// Advances when the stored file is replaced, so a fetch started before that
+/// cannot store its bytes in the new file.
+@property(nonatomic) NSUInteger generation;
 @property(nonatomic) NSTimeInterval lastAccess;
 @property(nonatomic) long long unsavedBytes;
 @property(nonatomic) NSInteger refCount;
@@ -130,7 +142,7 @@ static char kLoaderKey;
 
 /// Returns NO when the disk refuses the write. Playback continues uncached.
 - (BOOL)writeData:(NSData *)data at:(long long)offset {
-    if (!_writable) return NO;
+    if (!_writable || _discarded) return NO;
     NSFileHandle *h = [self openHandle];
     BOOL ok = NO;
     if (h) {
@@ -150,7 +162,7 @@ static char kLoaderKey;
 
 - (void)saveMeta {
     _unsavedBytes = 0;
-    if (!_hasMetadata) return;
+    if (!_hasMetadata || _discarded) return;
     [[NSFileManager defaultManager] createDirectoryAtPath:_directory withIntermediateDirectories:YES attributes:nil error:nil];
     NSMutableDictionary *meta = [NSMutableDictionary dictionary];
     meta[@"url"] = _url;
@@ -172,6 +184,7 @@ static char kLoaderKey;
 }
 
 - (void)reset {
+    _generation += 1;
     [_ranges removeAllObjects];
     _hasMetadata = NO;
     _validated = NO;
@@ -179,6 +192,18 @@ static char kLoaderKey;
     _ifRange = nil;
     _total = 0;
     _unsavedBytes = 0;
+    [self closeHandle];
+    [[NSFileManager defaultManager] removeItemAtPath:_directory error:nil];
+}
+
+/// Keeps what the player was already told about the stream, which it still
+/// relies on, and drops only the disk side: every read falls through to the
+/// network and nothing can recreate the directory.
+- (void)discard {
+    _discarded = YES;
+    _writable = NO;
+    _ifRange = nil;
+    [_ranges removeAllObjects];
     [self closeHandle];
     [[NSFileManager defaultManager] removeItemAtPath:_directory error:nil];
 }
@@ -195,6 +220,15 @@ static char kLoaderKey;
 @property(nonatomic) BOOL finished;
 @property(nonatomic) long long offset;
 @property(nonatomic) long long end;
+@property(nonatomic) long long taskStartOffset;
+/// Bytes at the head of the response before op.offset, from a server that
+/// ignored the requested range.
+@property(nonatomic) long long skip;
+@property(nonatomic) NSUInteger generation;
+@property(nonatomic) NSInteger retries;
+@property(nonatomic) BOOL dataStarted;
+/// The probe's response is a definite refusal, not a network failure.
+@property(nonatomic) BOOL refused;
 @end
 
 @implementation StreamCacheOp
@@ -240,6 +274,7 @@ static char kLoaderKey;
     long long _bytesSinceEvict;
     NSMutableDictionary<NSString *, StreamCacheEntry *> *_entries;
     NSMutableArray<StreamCacheOp *> *_ops;
+    NSMutableSet<NSString *> *_uncacheable;
 }
 
 + (instancetype)shared {
@@ -257,6 +292,7 @@ static char kLoaderKey;
     _root = [caches stringByAppendingPathComponent:@"stream_audio_cache"];
     _entries = [NSMutableDictionary dictionary];
     _ops = [NSMutableArray array];
+    _uncacheable = [NSMutableSet set];
     NSOperationQueue *delegateQueue = [[NSOperationQueue alloc] init];
     delegateQueue.underlyingQueue = _queue;
     delegateQueue.maxConcurrentOperationCount = 1;
@@ -284,13 +320,26 @@ static char kLoaderKey;
     return [_root stringByAppendingPathComponent:name];
 }
 
+/// NSURLSession lacks the media exemption AVPlayer gets from
+/// NSAllowsArbitraryLoadsForMedia, so an http stream that plays today could not
+/// be fetched here.
+static BOOL AllowsCleartextFetch(void) {
+    NSDictionary *ats = NSBundle.mainBundle.infoDictionary[@"NSAppTransportSecurity"];
+    return [ats[@"NSAllowsArbitraryLoads"] boolValue];
+}
+
 - (AVURLAsset *)assetForURI:(NSString *)uri options:(NSDictionary *)options {
     __block long long maxBytes;
-    dispatch_sync(_queue, ^{ maxBytes = self->_maxBytes; });
-    if (maxBytes <= 0) return nil;
+    __block BOOL uncacheable;
+    dispatch_sync(_queue, ^{
+        maxBytes = self->_maxBytes;
+        uncacheable = [self->_uncacheable containsObject:uri];
+    });
+    if (maxBytes <= 0 || uncacheable) return nil;
     NSURLComponents *components = [NSURLComponents componentsWithString:uri];
     NSString *scheme = components.scheme.lowercaseString;
-    if (![scheme isEqualToString:@"https"] && ![scheme isEqualToString:@"http"]) return nil;
+    BOOL cleartext = [scheme isEqualToString:@"http"];
+    if (![scheme isEqualToString:@"https"] && !(cleartext && AllowsCleartextFetch())) return nil;
     // A playlist's segments are resolved against the playlist URL, past any loader.
     if ([components.path.lowercaseString hasSuffix:@".m3u8"]) return nil;
     components.scheme = [kSchemePrefix stringByAppendingString:scheme];
@@ -323,10 +372,27 @@ static char kLoaderKey;
     dispatch_async(_queue, ^{
         entry.refCount -= 1;
         if (0 < entry.refCount) return;
+        // Nothing is left to deliver to, whatever AVFoundation chose to cancel.
+        for (StreamCacheOp *op in [self->_ops copy]) {
+            if (op.entry == entry) [self abandon:op];
+        }
         [entry saveMeta];
         [entry closeHandle];
-        [self->_entries removeObjectForKey:entry.url];
+        entry.discarded = YES;
+        [self detach:entry];
     });
+}
+
+- (void)detach:(StreamCacheEntry *)entry {
+    if (_entries[entry.url] == entry) [_entries removeObjectForKey:entry.url];
+}
+
+/// The server gives no stable file to store: what is playing keeps streaming,
+/// and later loads hand AVPlayer the URL directly, as if this cache did not exist.
+- (void)stopCaching:(StreamCacheEntry *)entry {
+    [_uncacheable addObject:entry.url];
+    [entry discard];
+    [self detach:entry];
 }
 
 #pragma mark Requests (on _queue)
@@ -350,15 +416,19 @@ static char kLoaderKey;
     op.probing = YES;
     NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:op.entry.url]];
     [r setValue:@"bytes=0-1" forHTTPHeaderField:@"Range"];
+    if (op.entry.hasMetadata) r.timeoutInterval = kStoredProbeTimeout;
     op.task = [_session dataTaskWithRequest:r];
     [op.task resume];
 }
 
 - (void)beginData:(StreamCacheOp *)op {
+    op.dataStarted = YES;
+    op.generation = op.entry.generation;
+    long long total = op.entry.total;
     AVAssetResourceLoadingContentInformationRequest *info = op.request.contentInformationRequest;
     if (info) {
         info.contentType = op.entry.contentType;
-        info.contentLength = op.entry.total;
+        if (0 < total) info.contentLength = total;
         info.byteRangeAccessSupported = op.entry.rangesSupported;
     }
     AVAssetResourceLoadingDataRequest *data = op.request.dataRequest;
@@ -367,8 +437,9 @@ static char kLoaderKey;
         return;
     }
     op.offset = data.currentOffset;
-    op.end = data.requestsAllDataToEndOfResource ? op.entry.total
-                                                 : data.requestedOffset + data.requestedLength;
+    op.end = data.requestsAllDataToEndOfResource ? LLONG_MAX : data.requestedOffset + data.requestedLength;
+    // Without a known length, the end of the response is the end of the stream.
+    if (0 < total) op.end = MIN(op.end, total);
     [self pump:op];
 }
 
@@ -376,6 +447,10 @@ static char kLoaderKey;
 /// turn, so a cancel from the player can get in between.
 - (void)pump:(StreamCacheOp *)op {
     if (op.finished) return;
+    if (op.request.isCancelled) {
+        [self abandon:op];
+        return;
+    }
     if (!(op.offset < op.end)) {
         [self finish:op error:nil];
         return;
@@ -391,14 +466,19 @@ static char kLoaderKey;
         } else {
             [op.request.dataRequest respondWithData:data];
             op.offset += data.length;
-            dispatch_async(_queue, ^{ [self pump:op]; });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kDeliveryIntervalNs), _queue, ^{ [self pump:op]; });
             return;
         }
     }
     long long holeEnd = [entry holeEndFrom:op.offset limit:op.end];
     NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:entry.url]];
-    [r setValue:[NSString stringWithFormat:@"bytes=%lld-%lld", op.offset, holeEnd - 1] forHTTPHeaderField:@"Range"];
-    if (entry.ifRange) [r setValue:entry.ifRange forHTTPHeaderField:@"If-Range"];
+    NSString *range = holeEnd == LLONG_MAX ? [NSString stringWithFormat:@"bytes=%lld-", op.offset]
+                                           : [NSString stringWithFormat:@"bytes=%lld-%lld", op.offset, holeEnd - 1];
+    [r setValue:range forHTTPHeaderField:@"Range"];
+    // A server without ranges answers 200 anyway, which would read as a changed file.
+    if (entry.ifRange && entry.rangesSupported) [r setValue:entry.ifRange forHTTPHeaderField:@"If-Range"];
+    op.taskStartOffset = op.offset;
+    op.skip = 0;
     op.task = [_session dataTaskWithRequest:r];
     [op.task resume];
 }
@@ -424,16 +504,39 @@ static char kLoaderKey;
     }
 }
 
+/// Ends an operation AVFoundation already considers over: finishing it again
+/// is not allowed.
+- (void)abandon:(StreamCacheOp *)op {
+    op.finished = YES;
+    [op.task cancel];
+    op.task = nil;
+    [_ops removeObject:op];
+    [op.entry saveMeta];
+}
+
 - (void)cancelRequest:(AVAssetResourceLoadingRequest *)request {
     for (StreamCacheOp *op in [_ops copy]) {
-        if (op.request != request) continue;
-        // AVFoundation already considers it over; it must not be finished again.
-        op.finished = YES;
-        [op.task cancel];
-        op.task = nil;
-        [_ops removeObject:op];
-        [op.entry saveMeta];
+        if (op.request == request) [self abandon:op];
     }
+}
+
+/// AVPlayer rides out a network drop when it loads a URL itself. Resuming from
+/// op.offset gives the same behavior; the bytes already delivered stay valid.
+- (void)retry:(StreamCacheOp *)op error:(NSError *)error {
+    if (kMaxRetries <= op.retries) {
+        [self finish:op error:error];
+        return;
+    }
+    op.retries += 1;
+    int64_t delay = (int64_t)(1LL << (op.retries - 1)) * NSEC_PER_SEC;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay), _queue, ^{
+        if (op.finished) return;
+        if (op.dataStarted) {
+            [self pump:op];
+        } else {
+            [self startProbe:op];
+        }
+    });
 }
 
 #pragma mark Response parsing
@@ -461,6 +564,28 @@ static NSString *ValidatorOf(NSHTTPURLResponse *response, long long total) {
     return 0 < total ? [NSString stringWithFormat:@"length:%lld", total] : nil;
 }
 
+static NSError *BadResponse(void) {
+    return [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorBadServerResponse userInfo:nil];
+}
+
+/// A captive portal's page says nothing about the stream behind it.
+static BOOL IsNotAudio(NSHTTPURLResponse *response) {
+    return [response.MIMEType.lowercaseString hasPrefix:@"text/"];
+}
+
+static BOOL IsTransientStatus(NSInteger status) {
+    return 500 <= status && status < 600;
+}
+
+/// Where the response body starts in the file. A 200 is the whole file.
+static long long BodyStart(NSHTTPURLResponse *response) {
+    if (response.statusCode != 206) return 0;
+    NSString *range = HeaderValue(response, @"Content-Range");
+    NSScanner *scanner = [NSScanner scannerWithString:range ?: @""];
+    long long start = 0;
+    return [scanner scanString:@"bytes" intoString:nil] && [scanner scanLongLong:&start] ? start : -1;
+}
+
 static NSString *IfRangeOf(NSHTTPURLResponse *response) {
     NSString *etag = HeaderValue(response, @"ETag");
     if (etag && ![etag hasPrefix:@"W/"]) return etag;
@@ -474,12 +599,14 @@ static NSString *ContentTypeOf(NSHTTPURLResponse *response, NSString *url) {
         NSString *mime = response.MIMEType.lowercaseString;
         if ([mime hasPrefix:@"audio/"]) {
             UTType *type = [UTType typeWithMIMEType:mime];
-            if (type) return type.identifier;
+            // An unknown MIME type yields a made-up dyn.* identifier AVPlayer rejects.
+            if (type.isDeclared) return type.identifier;
         }
         NSString *extension = [NSURLComponents componentsWithString:url].path.pathExtension;
         if (extension.length != 0) {
             UTType *type = [UTType typeWithFilenameExtension:extension];
-            if ([type conformsToType:UTTypeAudio]) return type.identifier;
+            // .mp4 is declared as a movie even when it holds only audio.
+            if (type.isDeclared && [type conformsToType:UTTypeAudiovisualContent]) return type.identifier;
         }
     }
     return @"public.mp3";
@@ -489,16 +616,24 @@ static NSString *ContentTypeOf(NSHTTPURLResponse *response, NSString *url) {
     long long total = TotalLength(response);
     NSString *validator = ValidatorOf(response, total);
     BOOL changed = entry.hasMetadata && (entry.total != total || ![entry.validator isEqualToString:validator]);
+    // Two answers within one load: this server has no stable identity.
+    if (changed && entry.validated) {
+        [self stopCaching:entry];
+        return;
+    }
     if (changed) [entry reset];
     entry.total = total;
     entry.validator = validator;
     entry.ifRange = IfRangeOf(response);
     entry.contentType = ContentTypeOf(response, entry.url);
     entry.rangesSupported = response.statusCode == 206;
-    // Without any identity a later request could not be matched to these bytes.
-    entry.writable = validator != nil && 0 < total && entry.writable;
     entry.hasMetadata = YES;
     entry.validated = YES;
+    // Without any identity a later request could not be matched to these bytes.
+    if (!validator || total <= 0) {
+        [self stopCaching:entry];
+        return;
+    }
     [entry saveMeta];
 }
 
@@ -511,40 +646,84 @@ static NSString *ContentTypeOf(NSHTTPURLResponse *response, NSString *url) {
         completionHandler(NSURLSessionResponseCancel);
         return;
     }
+    NSInteger status = http.statusCode;
+    BOOL success = status == 200 || status == 206;
     if (op.probing) {
-        if (http.statusCode == 200 || http.statusCode == 206) {
+        if (success && !IsNotAudio(http)) {
             [self adoptProbeResponse:http entry:op.entry];
         }
+        op.refused = !IsTransientStatus(status) && !success;
         // The outcome is read in didComplete; the two probe bytes are not needed.
         completionHandler(NSURLSessionResponseCancel);
         return;
     }
-    BOOL acceptable = http.statusCode == 206 || (http.statusCode == 200 && op.offset == 0);
-    NSString *validator = ValidatorOf(http, TotalLength(http));
-    if (!acceptable || (op.entry.validator && validator && ![op.entry.validator isEqualToString:validator])) {
-        // If-Range made the server answer with a different file, or it failed.
-        // Nothing fetched so far can be spliced with this: start over next load.
-        if (http.statusCode == 200) [op.entry reset];
+    if (!success || IsNotAudio(http)) {
+        op.task = nil;
         completionHandler(NSURLSessionResponseCancel);
-        [self finish:op error:[NSError errorWithDomain:NSURLErrorDomain
-                                                  code:NSURLErrorBadServerResponse
-                                              userInfo:@{NSLocalizedDescriptionKey : @"Stream changed on the server"}]];
+        if (success || IsTransientStatus(status)) {
+            [self retry:op error:BadResponse()];
+        } else {
+            [self finish:op error:BadResponse()];
+        }
         return;
     }
+    StreamCacheEntry *entry = op.entry;
+    BOOL sentIfRange = [task.originalRequest valueForHTTPHeaderField:@"If-Range"] != nil;
+    if (status == 200 && op.offset != 0 && sentIfRange) {
+        // If-Range says the file changed. Ask again for only the range needed.
+        [self stopCaching:entry];
+        op.task = nil;
+        completionHandler(NSURLSessionResponseCancel);
+        [self pump:op];
+        return;
+    }
+    NSString *validator = ValidatorOf(http, TotalLength(http));
+    if (!entry.discarded && entry.validator && validator && ![entry.validator isEqualToString:validator]) {
+        // Mid-playback there is nothing better to serve. Direct playback would
+        // receive these same bytes, so only the storing has to stop.
+        [self stopCaching:entry];
+    }
+    long long start = BodyStart(http);
+    if (start < 0 || op.offset < start) {
+        op.task = nil;
+        completionHandler(NSURLSessionResponseCancel);
+        [self retry:op error:BadResponse()];
+        return;
+    }
+    op.skip = op.offset - start;
     completionHandler(NSURLSessionResponseAllow);
 }
 
 - (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)task didReceiveData:(NSData *)data {
     StreamCacheOp *op = [self opForTask:task];
     if (!op || op.probing || op.finished) return;
-    if ([op.entry writeData:data at:op.offset]) {
-        _bytesSinceEvict += data.length;
-        if (kEvictInterval <= _bytesSinceEvict) [self evict];
-    } else {
-        [self evict];
+    NSData *body = data;
+    if (0 < op.skip) {
+        if ((long long)body.length <= op.skip) {
+            op.skip -= body.length;
+            return;
+        }
+        body = [body subdataWithRange:NSMakeRange((NSUInteger)op.skip, body.length - (NSUInteger)op.skip)];
+        op.skip = 0;
     }
-    [op.request.dataRequest respondWithData:data];
-    op.offset += data.length;
+    long long wanted = op.end - op.offset;
+    if (wanted < (long long)body.length) body = [body subdataWithRange:NSMakeRange(0, (NSUInteger)wanted)];
+    StreamCacheEntry *entry = op.entry;
+    BOOL current = op.generation == entry.generation;
+    BOOL wasStoring = current && entry.writable && !entry.discarded;
+    if (wasStoring) {
+        if ([entry writeData:body at:op.offset]) {
+            _bytesSinceEvict += body.length;
+            if (kEvictInterval <= _bytesSinceEvict) [self evict];
+        } else {
+            // Once per refusal: the disk is full, and a failed write will not recover by retrying each chunk.
+            [self evict];
+        }
+    }
+    [op.request.dataRequest respondWithData:body];
+    op.offset += body.length;
+    op.retries = 0;
+    if (!(op.offset < op.end)) [self finish:op error:nil];
 }
 
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
@@ -556,7 +735,11 @@ static NSString *ContentTypeOf(NSHTTPURLResponse *response, NSString *url) {
         if (!op.entry.validated) {
             // Offline: a stored entry is still the best available copy.
             if (!op.entry.hasMetadata) {
-                [self finish:op error:error ?: [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorBadServerResponse userInfo:nil]];
+                if (op.refused) {
+                    [self finish:op error:BadResponse()];
+                } else {
+                    [self retry:op error:error ?: BadResponse()];
+                }
                 return;
             }
             op.entry.validated = YES;
@@ -565,7 +748,16 @@ static NSString *ContentTypeOf(NSHTTPURLResponse *response, NSString *url) {
         return;
     }
     if (error) {
-        [self finish:op error:error];
+        [self retry:op error:error];
+        return;
+    }
+    if (op.end == LLONG_MAX) {
+        [self finish:op error:nil];
+        return;
+    }
+    // An empty answer would otherwise be asked for again without end.
+    if (op.offset == op.taskStartOffset) {
+        [self retry:op error:BadResponse()];
         return;
     }
     [self pump:op];
@@ -644,8 +836,12 @@ static NSString *ContentTypeOf(NSHTTPURLResponse *response, NSString *url) {
             if ([keep containsObject:e[@"url"]]) continue;
             StreamCacheEntry *live = self->_entries[e[@"url"]];
             if (live) {
-                // A stopped player can still hold its asset; reset keeps the entry consistent.
-                if (includeInUse) [live reset];
+                // A stopped player can still hold its asset, and only a new load
+                // should start storing again.
+                if (includeInUse) {
+                    [live discard];
+                    [self detach:live];
+                }
                 continue;
             }
             [[NSFileManager defaultManager] removeItemAtPath:e[@"directory"] error:nil];
