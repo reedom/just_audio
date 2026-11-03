@@ -30,6 +30,10 @@ static char kLoaderKey;
 @property(nonatomic, copy) NSString *validator;
 @property(nonatomic, copy) NSString *ifRange;
 @property(nonatomic, copy) NSString *contentType;
+/// Where the redirects ended for this load. Tracking prefixes can add seconds to
+/// every request, which is most of the wait after a seek. Not stored, because it
+/// can be signed or short-lived.
+@property(nonatomic, strong) NSURL *finalURL;
 @property(nonatomic) BOOL rangesSupported;
 @property(nonatomic) BOOL hasMetadata;
 @property(nonatomic) BOOL validated;
@@ -357,6 +361,7 @@ static BOOL AllowsCleartextFetch(void) {
         entry.refCount += 1;
         // Validation is per load: the server may have replaced the file since.
         entry.validated = NO;
+        entry.finalURL = nil;
         entry.writable = YES;
         entry.lastAccess = [NSDate date].timeIntervalSince1970;
     });
@@ -472,7 +477,7 @@ static BOOL AllowsCleartextFetch(void) {
         }
     }
     long long holeEnd = [entry holeEndFrom:op.offset limit:op.end];
-    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:entry.url]];
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:entry.finalURL ?: [NSURL URLWithString:entry.url]];
     NSString *range = holeEnd == LLONG_MAX ? [NSString stringWithFormat:@"bytes=%lld-", op.offset]
                                            : [NSString stringWithFormat:@"bytes=%lld-%lld", op.offset, holeEnd - 1];
     [r setValue:range forHTTPHeaderField:@"Range"];
@@ -631,6 +636,7 @@ static NSString *ContentTypeOf(NSHTTPURLResponse *response, NSString *url) {
 }
 
 - (void)adoptProbeResponse:(NSHTTPURLResponse *)response entry:(StreamCacheEntry *)entry {
+    entry.finalURL = response.URL;
     long long total = TotalLength(response);
     NSString *validator = ValidatorOf(response, total);
     BOOL changed = entry.hasMetadata && (entry.total != total || ![entry.validator isEqualToString:validator]);
@@ -653,6 +659,12 @@ static NSString *ContentTypeOf(NSHTTPURLResponse *response, NSString *url) {
         return;
     }
     [entry saveMeta];
+}
+
+/// Compares with the original URL, not the current final URL: another request
+/// may already have replaced or cleared that while this one was in flight.
+static BOOL UsedFinalURL(NSURLSessionTask *task, StreamCacheEntry *entry) {
+    return ![task.originalRequest.URL isEqual:[NSURL URLWithString:entry.url]];
 }
 
 #pragma mark NSURLSessionDataDelegate (on _queue)
@@ -678,6 +690,12 @@ static NSString *ContentTypeOf(NSHTTPURLResponse *response, NSString *url) {
     if (!success || IsNotAudio(http)) {
         op.task = nil;
         completionHandler(NSURLSessionResponseCancel);
+        if (UsedFinalURL(task, op.entry)) {
+            // Expired, most likely. The original URL leads to a fresh one.
+            op.entry.finalURL = nil;
+            [self pump:op];
+            return;
+        }
         if (success || IsTransientStatus(status)) {
             [self retry:op error:BadResponse()];
         } else {
@@ -688,8 +706,13 @@ static NSString *ContentTypeOf(NSHTTPURLResponse *response, NSString *url) {
     StreamCacheEntry *entry = op.entry;
     BOOL sentIfRange = [task.originalRequest valueForHTTPHeaderField:@"If-Range"] != nil;
     if (status == 200 && op.offset != 0 && sentIfRange) {
-        // If-Range says the file changed. Ask again for only the range needed.
-        [self stopCaching:entry];
+        // If-Range says the file changed, unless a stale link answered. Only the
+        // original URL can tell the two apart. Ask again for only the range needed.
+        if (UsedFinalURL(task, entry)) {
+            entry.finalURL = nil;
+        } else {
+            [self stopCaching:entry];
+        }
         op.task = nil;
         completionHandler(NSURLSessionResponseCancel);
         [self pump:op];
@@ -697,6 +720,15 @@ static NSString *ContentTypeOf(NSHTTPURLResponse *response, NSString *url) {
     }
     NSString *validator = ValidatorOf(http, TotalLength(http));
     if (!entry.discarded && entry.validator && validator && ![entry.validator isEqualToString:validator]) {
+        if (UsedFinalURL(task, entry)) {
+            // A stale link can answer with placeholder audio. Only the original
+            // URL can tell that from a file that really changed.
+            entry.finalURL = nil;
+            op.task = nil;
+            completionHandler(NSURLSessionResponseCancel);
+            [self pump:op];
+            return;
+        }
         // Mid-playback there is nothing better to serve. Direct playback would
         // receive these same bytes, so only the storing has to stop.
         [self stopCaching:entry];
@@ -709,6 +741,8 @@ static NSString *ContentTypeOf(NSHTTPURLResponse *response, NSString *url) {
         return;
     }
     op.skip = op.offset - start;
+    // After a clear, so that only one seek pays for the redirects again.
+    if (!entry.finalURL) entry.finalURL = http.URL;
     completionHandler(NSURLSessionResponseAllow);
 }
 
@@ -766,6 +800,8 @@ static NSString *ContentTypeOf(NSHTTPURLResponse *response, NSString *url) {
         return;
     }
     if (error) {
+        // The redirects may lead to a healthy host instead.
+        if (UsedFinalURL(task, op.entry)) op.entry.finalURL = nil;
         [self retry:op error:error];
         return;
     }

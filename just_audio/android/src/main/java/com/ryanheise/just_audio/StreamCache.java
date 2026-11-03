@@ -34,6 +34,7 @@ import java.util.Set;
 import java.util.TimeZone;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Disk cache for progressive streams.
@@ -78,9 +79,12 @@ final class StreamCache {
         final SimpleCache c = cache;
         final EpisodeLruEvictor e = evictor;
         if (c == null || e == null) return upstream;
+        // One factory per load, so each load follows the redirects once.
+        final AtomicReference<Uri> finalUrl = new AtomicReference<>();
+        final DataSource.Factory network = () -> new FinalUrlDataSource(upstream.createDataSource(), finalUrl);
         final CacheDataSource.Factory cached = new CacheDataSource.Factory()
                 .setCache(c)
-                .setUpstreamDataSourceFactory(() -> new ValidatingDataSource(upstream.createDataSource(), c))
+                .setUpstreamDataSourceFactory(() -> new ValidatingDataSource(network.createDataSource(), c))
                 // A broken cache must degrade to streaming, not to a playback failure.
                 .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR);
         // The player already holds what it read: the check must not delay a
@@ -91,9 +95,8 @@ final class StreamCache {
                 .setConnectTimeoutMs(PROBE_TIMEOUT_MS)
                 .setReadTimeoutMs(PROBE_TIMEOUT_MS);
         if (headers != null && !headers.isEmpty()) probes.setDefaultRequestProperties(headers);
-        // One factory per load, so the server is asked once per load.
         final AtomicBoolean probed = new AtomicBoolean(false);
-        return () -> new LoadDataSource(cached.createDataSource(), upstream.createDataSource(), probes, c, e, probed);
+        return () -> new LoadDataSource(cached.createDataSource(), network.createDataSource(), probes, c, e, probed, finalUrl);
     }
 
     static synchronized long size() {
@@ -122,6 +125,25 @@ final class StreamCache {
         cache.removeResource(url);
     }
 
+    /** The stream cannot be cached and has been marked to stream directly. */
+    private static final class UnstableIdentityException extends IOException {
+        UnstableIdentityException(String message) {
+            super(message);
+        }
+    }
+
+    /**
+     * For sources being abandoned: their bytes are no longer wanted, and an error
+     * from closing them must not replace the reason they were abandoned.
+     */
+    private static void closeQuietly(DataSource source) {
+        try {
+            source.close();
+        } catch (IOException ignored) {
+            // Nothing depends on this connection any more.
+        }
+    }
+
     private static String keyOf(DataSpec spec) {
         return spec.key != null ? spec.key : spec.uri.toString();
     }
@@ -144,21 +166,25 @@ final class StreamCache {
      */
     private static final class LoadDataSource implements DataSource {
         private final DataSource cached;
-        private final HttpDataSource direct;
+        private final DataSource direct;
         private final HttpDataSource.Factory probes;
         private final Cache cache;
         private final EpisodeLruEvictor evictor;
         private final AtomicBoolean probed;
+        private final AtomicReference<Uri> finalUrl;
         @Nullable private DataSource current;
         @Nullable private String openKey;
+        @Nullable private DataSpec openSpec;
+        private long bytesRead;
 
-        LoadDataSource(DataSource cached, HttpDataSource direct, HttpDataSource.Factory probes, Cache cache, EpisodeLruEvictor evictor, AtomicBoolean probed) {
+        LoadDataSource(DataSource cached, DataSource direct, HttpDataSource.Factory probes, Cache cache, EpisodeLruEvictor evictor, AtomicBoolean probed, AtomicReference<Uri> finalUrl) {
             this.cached = cached;
             this.direct = direct;
             this.probes = probes;
             this.cache = cache;
             this.evictor = evictor;
             this.probed = probed;
+            this.finalUrl = finalUrl;
         }
 
         @Override
@@ -168,7 +194,28 @@ final class StreamCache {
             current = uncacheable.contains(key) ? direct : cached;
             openKey = key;
             evictor.acquire(key);
-            return current.open(spec);
+            openSpec = spec;
+            bytesRead = 0;
+            try {
+                return current.open(spec);
+            } catch (UnstableIdentityException e) {
+                return switchToDirect();
+            }
+        }
+
+        /**
+         * Continues in place, because the player must not see this as a failure.
+         * A retry after a failed first request of a seek resumes from where the
+         * extractor last read, not from the seek target: the player then reads
+         * forward until its buffer limit and waits there forever.
+         */
+        private long switchToDirect() throws IOException {
+            closeQuietly(current);
+            current = direct;
+            // The final URL may be what served the other file: a stale link can
+            // answer with placeholder audio, which an error status would not reveal.
+            finalUrl.set(null);
+            return direct.open(openSpec.subrange(bytesRead));
         }
 
         /** Best-effort: offline, a stored entry is still the best available copy. */
@@ -182,6 +229,7 @@ final class StreamCache {
                     Map<String, List<String>> headers = probe.getResponseHeaders();
                     String validator = validatorOf(headers);
                     if (isNotAudio(headers)) return;
+                    finalUrl.set(probe.getUri());
                     if (known != null && !known.equals(validator)) cache.removeResource(key);
                 } finally {
                     probe.close();
@@ -193,7 +241,16 @@ final class StreamCache {
 
         @Override
         public int read(@NonNull byte[] buffer, int offset, int length) throws IOException {
-            return current.read(buffer, offset, length);
+            int count;
+            try {
+                count = current.read(buffer, offset, length);
+            } catch (UnstableIdentityException e) {
+                // The cache moved from a stored range on to a hole.
+                switchToDirect();
+                count = current.read(buffer, offset, length);
+            }
+            if (0 < count) bytesRead += count;
+            return count;
         }
 
         @Override
@@ -226,16 +283,82 @@ final class StreamCache {
     }
 
     /**
+     * Requests the URL the redirects ended at instead of following them again.
+     *
+     * Tracking prefixes can add seconds to every request, which is most of the
+     * wait after a seek. The cache key stays the original URL, so a stored entry
+     * outlives a final URL that is signed or short-lived.
+     */
+    private static final class FinalUrlDataSource implements DataSource {
+        private final HttpDataSource upstream;
+        private final AtomicReference<Uri> finalUrl;
+
+        FinalUrlDataSource(HttpDataSource upstream, AtomicReference<Uri> finalUrl) {
+            this.upstream = upstream;
+            this.finalUrl = finalUrl;
+        }
+
+        @Override
+        public long open(@NonNull DataSpec spec) throws IOException {
+            Uri known = finalUrl.get();
+            if (known == null) return openOriginal(spec);
+            try {
+                long length = upstream.open(spec.buildUpon().setUri(known).build());
+                if (!isNotAudio(upstream.getResponseHeaders())) return length;
+            } catch (HttpDataSource.HttpDataSourceException e) {
+                // Expired or unreachable. The original URL leads to a fresh one,
+                // and a real outage fails there too.
+            }
+            finalUrl.set(null);
+            closeQuietly(upstream);
+            return openOriginal(spec);
+        }
+
+        private long openOriginal(DataSpec spec) throws IOException {
+            long length = upstream.open(spec);
+            finalUrl.set(upstream.getUri());
+            return length;
+        }
+
+        @Override
+        public int read(@NonNull byte[] buffer, int offset, int length) throws IOException {
+            return upstream.read(buffer, offset, length);
+        }
+
+        @Override
+        public void addTransferListener(@NonNull TransferListener listener) {
+            upstream.addTransferListener(listener);
+        }
+
+        @Nullable
+        @Override
+        public Uri getUri() {
+            return upstream.getUri();
+        }
+
+        @NonNull
+        @Override
+        public Map<String, List<String>> getResponseHeaders() {
+            return upstream.getResponseHeaders();
+        }
+
+        @Override
+        public void close() throws IOException {
+            upstream.close();
+        }
+    }
+
+    /**
      * Upstream of the cache: keeps bytes of a different file out of an entry.
      *
      * Hosts with dynamic ad insertion can serve a different file per request.
      * CacheDataSource keys on the URL alone and would store the two as one.
      */
     private static final class ValidatingDataSource implements DataSource {
-        private final HttpDataSource upstream;
+        private final DataSource upstream;
         private final Cache cache;
 
-        ValidatingDataSource(HttpDataSource upstream, Cache cache) {
+        ValidatingDataSource(DataSource upstream, Cache cache) {
             this.upstream = upstream;
             this.cache = cache;
         }
@@ -245,7 +368,7 @@ final class StreamCache {
             long length = upstream.open(spec);
             Map<String, List<String>> headers = upstream.getResponseHeaders();
             if (isNotAudio(headers)) {
-                upstream.close();
+                closeQuietly(upstream);
                 // A captive portal's page: it says nothing about the stored file.
                 throw new IOException("Not audio: " + spec.uri);
             }
@@ -253,17 +376,17 @@ final class StreamCache {
             String key = keyOf(spec);
             if (validator == null) {
                 bypass(key);
-                upstream.close();
-                throw new IOException("Stream has no identity: " + key);
+                closeQuietly(upstream);
+                throw new UnstableIdentityException("Stream has no identity: " + key);
             }
             try {
                 String known = cache.getContentMetadata(key).get(VALIDATOR_KEY, (String) null);
                 if (known != null && !known.equals(validator)) {
                     // The load's probe already matched, so this server's identity
-                    // is not stable. ExoPlayer's retry goes around the cache.
+                    // is not stable.
                     bypass(key);
-                    upstream.close();
-                    throw new IOException("Stream identity is not stable: " + key);
+                    closeQuietly(upstream);
+                    throw new UnstableIdentityException("Stream identity is not stable: " + key);
                 }
                 if (known == null) {
                     ContentMetadataMutations mutations = new ContentMetadataMutations();
@@ -311,7 +434,7 @@ final class StreamCache {
         }
 
         @Override
-        public void close() throws HttpDataSource.HttpDataSourceException {
+        public void close() throws IOException {
             upstream.close();
         }
     }
